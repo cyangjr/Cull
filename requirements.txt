@@ -1,0 +1,13 @@
+streamlit>=1.32
+numpy>=1.26
+pandas>=2.2
+PyYAML>=6.0
+Pillow>=10.2
+exifread>=3.0.0
+opencv-python>=4.9
+mediapipe>=0.10
+ImageHash>=4.3
+
+# Optional (recommended for later phases / CUDA preference):
+# Install PyTorch separately using the official selector for your CUDA version.
+# Keeping it out of requirements.txt avoids accidentally pulling CPU-only wheels.

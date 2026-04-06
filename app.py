@@ -72,7 +72,13 @@ def main() -> None:
                 progress.progress(max(0.0, min(1.0, float(frac))))
                 status.text(msg)
 
-            session.start(folder_path, progress_callback=on_progress)
+            cleaned = folder_path.strip().strip('"').strip("'").strip()
+            try:
+                session.start(cleaned, progress_callback=on_progress)
+            except FileNotFoundError as e:
+                st.error(str(e))
+                st.stop()
+
             st.session_state["records"] = session.records
             status.text("Done")
 
@@ -103,6 +109,12 @@ def main() -> None:
                 "filename": r.filename,
                 "final_score": r.final_score,
                 "passed_gate": r.passed_gate,
+                "has_faces": r.has_faces,
+                "scene_type": r.scene_type,
+                "is_duplicate": r.is_duplicate,
+                "motion_blur": r.motion_blur_detected,
+                "aesthetic": r.aesthetic_score,
+                "tags": ",".join(r.composition_tags or []),
                 "sharpness": r.sharpness_score,
                 "exposure": r.exposure_score,
                 "white_balance": r.white_balance_score,
@@ -117,14 +129,32 @@ def main() -> None:
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.subheader("Thumbnails")
-    cols = st.columns(4)
-    for i, r in enumerate(filtered[:80]):  # cap for UI responsiveness
-        b = load_thumbnail(r.path)
-        with cols[i % 4]:
-            if b is not None:
-                st.image(b, caption=f"{r.filename}\n{(r.final_score or 0.0):.3f}")
-            else:
-                st.write(r.filename)
+    top10 = df.head(10).to_dict(orient="records")
+    bottom10 = df.tail(10).sort_values(by=["final_score"], ascending=True, na_position="last").to_dict(orient="records")
+
+    col_top, col_bottom = st.columns(2)
+
+    with col_top:
+        st.markdown("**Top 10**")
+        cols = st.columns(2)
+        for i, r in enumerate(top10):
+            b = load_thumbnail(r["path"])
+            with cols[i % 2]:
+                if b is not None:
+                    st.image(b, caption=f"{r['filename']}\n{(r.get('final_score') or 0.0):.3f}")
+                else:
+                    st.write(r["filename"])
+
+    with col_bottom:
+        st.markdown("**Bottom 10**")
+        cols = st.columns(2)
+        for i, r in enumerate(bottom10):
+            b = load_thumbnail(r["path"])
+            with cols[i % 2]:
+                if b is not None:
+                    st.image(b, caption=f"{r['filename']}\n{(r.get('final_score') or 0.0):.3f}")
+                else:
+                    st.write(r["filename"])
 
 
 if __name__ == "__main__":

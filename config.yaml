@@ -1,0 +1,31 @@
+final_score_weights:
+  sharpness: 0.4
+  exposure: 0.15
+  white_balance: 0.15
+  aesthetic: 0.3
+
+sharpness_gate_threshold: 0.3
+
+# Phase C (kept for forward compatibility; not used in Phase A MVP)
+motion_blur_score_penalty: 0.5
+yolo_confidence_threshold: 0.4
+hash_threshold: 8
+timestamp_window_s: 2.0
+
+# Milestone C toggles (safe defaults; heavy ML stages can remain off)
+enable_router: true
+enable_object_detector: true
+enable_saliency_detector: true
+enable_face_detector: true
+enable_motion_blur: true
+enable_aesthetic: true
+enable_composition_tags: true
+enable_dedup: true
+
+# Milestone C knobs
+min_face_detection_confidence: 0.5
+saliency_peak_threshold: 0.6
+
+# Memory/perf
+batch_size: 16
+release_pixel_data: true
