@@ -45,6 +45,36 @@ class CullPipeline:
         folder_path: str,
         progress_callback: Callable[[float, str], None] | None = None,
     ) -> list[ImageRecord]:
+        """
+        Run the culling pipeline on a folder of images.
+
+        Automatically chooses sequential or parallel execution based on config.num_workers.
+
+        Args:
+            folder_path: Path to folder containing images
+            progress_callback: Optional callback(fraction, message) for progress updates
+
+        Returns:
+            List of ImageRecords sorted by final_score descending
+        """
+        from .cpu_utils import get_safe_worker_count
+
+        # Determine execution mode
+        workers = get_safe_worker_count(self.config.num_workers)
+
+        if workers <= 1:
+            # Sequential mode
+            return self._run_sequential(folder_path, progress_callback)
+        else:
+            # Parallel mode
+            return self._run_parallel(folder_path, progress_callback, workers)
+
+    def _run_sequential(
+        self,
+        folder_path: str,
+        progress_callback: Callable[[float, str], None] | None = None,
+    ) -> list[ImageRecord]:
+        """Original sequential implementation (Phase A MVP)."""
         folder = ImageLoader._normalise_path(folder_path)
         paths = [p for p in sorted(folder.iterdir()) if p.is_file() and self.image_loader.is_supported(p)]
         n = max(1, len(paths))
@@ -156,4 +186,124 @@ class CullPipeline:
     def _run_gate(self, record: ImageRecord) -> None:
         thr = float(self.config.sharpness_gate_threshold)
         record.passed_gate = bool((record.sharpness_score or 0.0) >= thr)
+
+    def _run_parallel(
+        self,
+        folder_path: str,
+        progress_callback: Callable[[float, str], None] | None = None,
+        num_workers: int = 4,
+    ) -> list[ImageRecord]:
+        """
+        Parallel implementation using ProcessPoolExecutor.
+
+        Strategy:
+            1. Parallel image loading (I/O bound)
+            2. Parallel pre-gate processing (CPU bound)
+            3. Parallel post-gate processing (CPU bound, smaller set)
+            4. Sequential deduplication (needs all records)
+            5. Sequential ranking (fast, needs all records)
+
+        Args:
+            folder_path: Path to folder containing images
+            progress_callback: Optional callback(fraction, message)
+            num_workers: Number of worker processes
+
+        Returns:
+            List of ImageRecords sorted by final_score
+        """
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from .parallel import config_to_dict, worker_load_image, worker_process_postgate, worker_process_pregate
+
+        folder = ImageLoader._normalise_path(folder_path)
+        paths = [p for p in sorted(folder.iterdir()) if p.is_file() and self.image_loader.is_supported(p)]
+        n = max(1, len(paths))
+
+        # Convert config to dict for serialization
+        config_dict = config_to_dict(self.config)
+
+        records: list[ImageRecord] = []
+        processed_count = 0
+
+        # Phase 1: Parallel image loading + pre-gate processing
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all image loading tasks
+            future_to_path = {executor.submit(worker_load_image, str(p)): p for p in paths}
+
+            for future in as_completed(future_to_path):
+                path = future_to_path[future]
+                try:
+                    record = future.result()
+                    if record is None:
+                        # Load failed, skip this image
+                        processed_count += 1
+                        if progress_callback:
+                            progress_callback(processed_count / n, f"Loading images...")
+                        continue
+
+                    # Immediately submit for pre-gate processing
+                    pregate_future = executor.submit(worker_process_pregate, record, config_dict)
+                    processed_record = pregate_future.result()
+                    records.append(processed_record)
+
+                    processed_count += 1
+                    if progress_callback:
+                        progress_callback(
+                            processed_count / n,
+                            f"Processing {processed_record.filename}",
+                        )
+
+                except Exception:
+                    # Skip failed images
+                    processed_count += 1
+                    if progress_callback:
+                        progress_callback(processed_count / n, "Processing...")
+                    continue
+
+        # Phase 2: Parallel post-gate processing (only gate-passed images)
+        passed = [r for r in records if r.passed_gate]
+
+        if passed:
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                future_to_record = {executor.submit(worker_process_postgate, r, config_dict): r for r in passed}
+
+                for i, future in enumerate(as_completed(future_to_record), 1):
+                    try:
+                        processed_record = future.result()
+                        # Update record in-place (same object reference)
+                        original = future_to_record[future]
+                        # Copy scores back to original record
+                        original.motion_blur_detected = processed_record.motion_blur_detected
+                        original.aesthetic_score = processed_record.aesthetic_score
+                        original.composition_tags = processed_record.composition_tags
+                        original.final_score = processed_record.final_score
+                        original.perceptual_hash = processed_record.perceptual_hash
+                        original.saliency_peak_region = processed_record.saliency_peak_region
+                        # Pixel data already released by worker
+                        original.image = None
+                        original.saliency_map = None
+
+                        if progress_callback:
+                            progress_callback(
+                                (n + i) / (n + len(passed)),
+                                f"Post-processing {original.filename}",
+                            )
+                    except Exception:
+                        # Post-gate processing failed, keep record with partial scores
+                        continue
+
+        # Phase 3: Sequential deduplication (needs all records at once)
+        if self.config.enable_dedup and len(passed) > 1:
+            if progress_callback:
+                progress_callback(0.95, "Deduplicating...")
+            self.duplicate_filter.filter(passed)
+
+        # Recompute final scores after dedup flags
+        for r in passed:
+            self.final_scorer.compute(r)
+
+        # Phase 4: Sequential ranking
+        if progress_callback:
+            progress_callback(1.0, "Ranking...")
+
+        return self.final_scorer.rank(records)
 

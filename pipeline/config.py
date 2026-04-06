@@ -51,6 +51,7 @@ class PipelineConfig:
     # memory/perf
     batch_size: int = 16
     release_pixel_data: bool = True
+    num_workers: int | None = None  # None = auto-detect (50% of cores)
 
     @staticmethod
     def load(path: str | None = None) -> "PipelineConfig":
@@ -74,7 +75,7 @@ class PipelineConfig:
             "min_face_detection_confidence",
             "saliency_peak_threshold",
         }
-        int_keys = {"hash_threshold", "batch_size"}
+        int_keys = {"hash_threshold", "batch_size", "num_workers"}
         bool_keys = {
             "enable_router",
             "enable_object_detector",
@@ -88,6 +89,14 @@ class PipelineConfig:
         }
 
         for k, v in data.items():
+            # Special handling for num_workers: None is valid (auto-detect)
+            if k == "num_workers":
+                if v is None:
+                    cfg.num_workers = None
+                else:
+                    cfg.num_workers = int(v) if v != 0 else 0
+                continue
+
             if v is None:
                 continue
             if k in float_keys:

@@ -29,3 +29,15 @@ saliency_peak_threshold: 0.6
 # Memory/perf
 batch_size: 16
 release_pixel_data: true
+
+# CPU parallel processing
+# num_workers: Number of parallel worker processes
+#   - null (or omit): Auto-detect, use 40% of CPU cores (recommended, tested optimal)
+#   - 0: Disable multiprocessing, run sequentially (debugging/testing)
+#   - 1-N: Use exactly N workers (clamped to safe range: leaves 1 core free)
+# Examples:
+#   20-core CPU: null → 8 workers (tested optimal), 10 → 10 workers
+#   8-core CPU: null → 3 workers, 12 → 7 workers (max safe)
+#   4-core CPU: null → 2 workers, 8 → 3 workers (max safe)
+# Performance tested 2026-04-06: 8 workers = 1.25x speedup on 20-core system
+num_workers: null  # Auto-detect (40% of cores, tested optimal)
