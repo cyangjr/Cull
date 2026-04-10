@@ -21,7 +21,7 @@ from .utils import DeviceManager, ImageLoader, ImageRecord, ModelRegistry
 class CullPipeline:
     def __init__(self, config: PipelineConfig | None = None) -> None:
         self.config = config or PipelineConfig.load()
-        self.device = DeviceManager().get_device()
+        self.device = DeviceManager().get_device(self.config.device)
 
         # Phase A: ModelRegistry not used yet, but present for Phase C shape.
         self.model_registry = ModelRegistry(device=self.device)
@@ -48,7 +48,11 @@ class CullPipeline:
         """
         Run the culling pipeline on a folder of images.
 
-        Automatically chooses sequential or parallel execution based on config.num_workers.
+        Chooses the appropriate execution mode:
+          - GPU (cuda/mps): sequential GPU-batch mode — multiprocessing is disabled
+            because CUDA contexts cannot be safely shared across spawned processes.
+          - CPU + workers > 1: parallel multiprocessing mode (existing).
+          - CPU + workers ≤ 1: sequential CPU mode (existing).
 
         Args:
             folder_path: Path to folder containing images
@@ -57,16 +61,16 @@ class CullPipeline:
         Returns:
             List of ImageRecords sorted by final_score descending
         """
+        # GPU mode bypasses multiprocessing entirely.
+        if self.device in ("cuda", "mps"):
+            return self._run_gpu_batch(folder_path, progress_callback)
+
         from .cpu_utils import get_safe_worker_count
 
-        # Determine execution mode
         workers = get_safe_worker_count(self.config.num_workers)
-
         if workers <= 1:
-            # Sequential mode
             return self._run_sequential(folder_path, progress_callback)
         else:
-            # Parallel mode
             return self._run_parallel(folder_path, progress_callback, workers)
 
     def _run_sequential(
@@ -180,6 +184,192 @@ class CullPipeline:
         # Progress wrap-up
         if progress_callback:
             progress_callback(1.0, "Ranking")
+
+        return self.final_scorer.rank(records)
+
+    def _run_gpu_batch(
+        self,
+        folder_path: str,
+        progress_callback: Callable[[float, str], None] | None = None,
+    ) -> list[ImageRecord]:
+        """
+        GPU-batch execution mode for CUDA and Apple Silicon (MPS).
+
+        Images are loaded sequentially (I/O bound), then processed in batches
+        of gpu_batch_size using GPU-accelerated torch ops for the expensive stages.
+        Every GPU call has a CPU fallback — if torch raises for any reason the
+        scorer's original CPU method is used for that batch.
+
+        Stages per batch:
+            1.  Load images (CPU, I/O)
+            2.  Face detection + scene routing (CPU, MediaPipe)
+            3.  Sharpness — GPU Laplacian conv2d
+            4.  Exposure + white balance (CPU, trivial)
+            5.  Gate check
+            6.  Motion blur — GPU FFT  (pre-gate metadata, run on all images)
+            7.  Release gate-failed pixel data
+            8.  Saliency — GPU Sobel conv2d  (scene-type gate-passed only)
+            9.  Aesthetic — GPU RGB→Gray/HSV  (gate-passed only)
+            10. Composition tagging (CPU, geometric)
+            11. Final score + perceptual hash + pixel release
+        After all batches: dedup + re-score + rank (same as other modes).
+        """
+        folder = ImageLoader._normalise_path(folder_path)
+        paths = [p for p in sorted(folder.iterdir()) if p.is_file() and self.image_loader.is_supported(p)]
+        n = max(1, len(paths))
+        gpu_batch_size = max(1, int(self.config.gpu_batch_size))
+        device = self.device
+
+        records: list[ImageRecord] = []
+        processed_count = 0
+
+        for batch_start in range(0, len(paths), gpu_batch_size):
+            batch_paths = paths[batch_start: batch_start + gpu_batch_size]
+
+            # --- 1. Load ---
+            batch: list[ImageRecord] = []
+            for p in batch_paths:
+                try:
+                    batch.append(self.image_loader.load(str(p)))
+                except Exception:
+                    continue
+            if not batch:
+                continue
+
+            # --- 2. Face detection + routing (CPU) ---
+            for r in batch:
+                if self.config.enable_router:
+                    if self.config.enable_face_detector:
+                        try:
+                            self.face_detector.detect(r)
+                        except Exception:
+                            pass
+                    self.router.classify(r)
+                # Second face-detect pass for non-routed images (mirrors sequential logic)
+                if self.config.enable_face_detector and not r.has_faces:
+                    try:
+                        self.face_detector.detect(r)
+                    except Exception:
+                        pass
+
+            # --- 3. Sharpness — GPU ---
+            valid = [r for r in batch if r.image is not None]
+            regions = [self.sharpness_scorer._select_region(r) for r in valid]
+            try:
+                scores = self.sharpness_scorer.score_batch_gpu(regions, device)
+                for r, s in zip(valid, scores):
+                    r.sharpness_score = s
+            except Exception:
+                for r in batch:
+                    self.sharpness_scorer.score(r)
+
+            # --- 4. Exposure + white balance (CPU) ---
+            for r in batch:
+                self.exposure_scorer.score(r)
+                self.white_balance_scorer.score(r)
+
+            # --- 5. Gate check ---
+            for r in batch:
+                self._run_gate(r)
+
+            # --- 6. Motion blur — GPU (metadata; not gate input) ---
+            if self.config.enable_motion_blur:
+                mb_batch = [r for r in batch if r.image is not None]
+                if mb_batch:
+                    try:
+                        blur_results = self.motion_blur_detector.detect_batch_gpu(
+                            [r.image for r in mb_batch], device
+                        )
+                        for r, detected in zip(mb_batch, blur_results):
+                            r.motion_blur_detected = detected
+                    except Exception:
+                        for r in mb_batch:
+                            self.motion_blur_detector.detect(r)
+
+            # --- 7. Release gate-failed pixel data ---
+            if self.config.release_pixel_data:
+                for r in batch:
+                    if not r.passed_gate:
+                        r.image = None
+
+            # --- 8. Saliency — GPU (scene-type, gate-passed) ---
+            passed_batch = [r for r in batch if r.passed_gate]
+            if self.config.enable_saliency_detector:
+                scene_batch = [r for r in passed_batch if r.scene_type == "scene" and r.image is not None]
+                if scene_batch:
+                    try:
+                        self.saliency_detector.detect_batch_gpu(scene_batch, device)
+                    except Exception:
+                        for r in scene_batch:
+                            self.saliency_detector.detect(r)
+                    if self.config.release_pixel_data:
+                        for r in scene_batch:
+                            r.saliency_map = None
+
+            # Object detection (CPU, heuristic — no GPU benefit)
+            if self.config.enable_object_detector:
+                for r in passed_batch:
+                    if r.scene_type == "object":
+                        self.object_detector.detect(r)
+
+            # --- 9. Aesthetic — GPU (gate-passed) ---
+            if self.config.enable_aesthetic:
+                aes_batch = [r for r in passed_batch if r.image is not None]
+                if aes_batch:
+                    try:
+                        aes_scores = self.aesthetic_scorer.score_batch_gpu(
+                            [r.image for r in aes_batch], device
+                        )
+                        for r, s in zip(aes_batch, aes_scores):
+                            r.aesthetic_score = s
+                    except Exception:
+                        for r in aes_batch:
+                            self.aesthetic_scorer.score(r)
+
+            # --- 10. Composition tagging (CPU) ---
+            if self.config.enable_composition_tags:
+                for r in passed_batch:
+                    if r.image is not None:
+                        try:
+                            self.composition_tagger.tag(r)
+                        except Exception:
+                            pass
+
+            # --- 11. Final score + hash + pixel release ---
+            for r in passed_batch:
+                self.final_scorer.compute(r)
+                if self.config.enable_dedup and r.image is not None:
+                    try:
+                        import imagehash
+                        from PIL import Image
+                        r.perceptual_hash = str(imagehash.phash(Image.fromarray(r.image)))
+                    except Exception:
+                        pass
+                if self.config.release_pixel_data:
+                    r.image = None
+                    r.saliency_map = None
+
+            records.extend(batch)
+            processed_count += len(batch)
+            if progress_callback:
+                progress_callback(
+                    processed_count / n,
+                    f"GPU batch {batch_start // gpu_batch_size + 1}: {processed_count}/{n}",
+                )
+
+        # --- Dedup + re-score + rank (same as other modes) ---
+        passed = [r for r in records if r.passed_gate]
+
+        if self.config.enable_dedup and len(passed) > 1:
+            if progress_callback:
+                progress_callback(0.95, "Deduplicating...")
+            self.duplicate_filter.filter(passed)
+
+        for r in passed:
+            self.final_scorer.compute(r)
+
+        if progress_callback:
+            progress_callback(1.0, "Ranking...")
 
         return self.final_scorer.rank(records)
 

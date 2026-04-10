@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(.venv/Scripts/python.exe -m py_compile scripts/test_multiprocessing.py scripts/test_cpu_config.py)",
-      "Bash(.venv/Scripts/python.exe -c \"from pipeline.cpu_utils import get_safe_worker_count, get_cpu_info; print(''cpu_utils: OK'')\")"
+      "Bash(.venv/Scripts/python.exe -c \"from pipeline.cpu_utils import get_safe_worker_count, get_cpu_info; print(''cpu_utils: OK'')\")",
+      "Bash(.venv/Scripts/python.exe -c ':*)"
     ],
     "deny": [],
     "ask": []

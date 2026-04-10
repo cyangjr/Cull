@@ -29,7 +29,27 @@ class DeviceManager:
             pass
         return "cpu"
 
-    def get_device(self) -> str:
+    def get_device(self, requested: str = "auto") -> str:
+        """
+        Resolve device string to the actual device to use.
+
+        Args:
+            requested: "auto" | "cpu" | "cuda" | "mps"
+                - "auto": prefer cuda > mps > cpu
+                - "cpu":  always CPU (skips detection)
+                - "cuda" | "mps": use if available, else fall back to auto-detect
+
+        Returns:
+            One of "cuda", "mps", or "cpu".
+        """
+        if requested == "cpu":
+            self._device = "cpu"
+            return "cpu"
+        if requested in ("cuda", "mps"):
+            detected = self.detect()
+            self._device = requested if detected == requested else detected
+            return self._device
+        # auto
         if self._device is None:
             self._device = self.detect()
         return self._device

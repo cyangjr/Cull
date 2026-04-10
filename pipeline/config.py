@@ -51,7 +51,11 @@ class PipelineConfig:
     # memory/perf
     batch_size: int = 16
     release_pixel_data: bool = True
-    num_workers: int | None = None  # None = auto-detect (50% of cores)
+    num_workers: int | None = None  # None = auto-detect (40% of cores)
+
+    # device / GPU
+    device: str = "auto"      # auto|cpu|cuda|mps
+    gpu_batch_size: int = 8   # images per GPU batch
 
     @staticmethod
     def load(path: str | None = None) -> "PipelineConfig":
@@ -75,7 +79,7 @@ class PipelineConfig:
             "min_face_detection_confidence",
             "saliency_peak_threshold",
         }
-        int_keys = {"hash_threshold", "batch_size", "num_workers"}
+        int_keys = {"hash_threshold", "batch_size", "num_workers", "gpu_batch_size"}
         bool_keys = {
             "enable_router",
             "enable_object_detector",
@@ -89,6 +93,12 @@ class PipelineConfig:
         }
 
         for k, v in data.items():
+            # Special handling for device: validate against allowed values
+            if k == "device":
+                if isinstance(v, str) and v in ("auto", "cpu", "cuda", "mps"):
+                    cfg.device = v
+                continue
+
             # Special handling for num_workers: None is valid (auto-detect)
             if k == "num_workers":
                 if v is None:

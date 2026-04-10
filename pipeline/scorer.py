@@ -8,6 +8,23 @@ import numpy as np
 from .config import PipelineConfig
 from .utils import ImageRecord
 
+# ---------------------------------------------------------------------------
+# Torch availability — checked once and cached.
+# All GPU methods guard with this so the pipeline works without PyTorch.
+# ---------------------------------------------------------------------------
+_TORCH_AVAILABLE: bool | None = None
+
+
+def _torch_available() -> bool:
+    global _TORCH_AVAILABLE
+    if _TORCH_AVAILABLE is None:
+        try:
+            import torch  # noqa: F401
+            _TORCH_AVAILABLE = True
+        except ImportError:
+            _TORCH_AVAILABLE = False
+    return _TORCH_AVAILABLE
+
 
 class SharpnessScorer:
     def score(self, record: ImageRecord) -> None:
@@ -48,6 +65,48 @@ class SharpnessScorer:
         # Normalise to 0..1 with a soft saturation curve (empirical).
         score = 1.0 - math.exp(-float(v) / 500.0)
         return float(max(0.0, min(1.0, score)))
+
+    def score_batch_gpu(self, regions: list[np.ndarray], device: str) -> list[float]:
+        """
+        Compute Laplacian variance for a batch of image regions on the GPU.
+
+        Uses torch.nn.functional.conv2d with a fixed 3×3 Laplacian kernel —
+        identical math to _laplacian_variance(), so scores are directly comparable.
+
+        Args:
+            regions: Pre-selected H×W×3 uint8 numpy arrays (one per image).
+            device:  "cuda" or "mps" (also accepts "cpu" for parity testing).
+
+        Returns:
+            List of float sharpness scores in [0, 1].
+
+        Raises:
+            ImportError: if torch is not installed (caller should catch and fall back).
+        """
+        import torch
+        import torch.nn.functional as F
+
+        dev = torch.device(device)
+        lap_kernel = torch.tensor(
+            [[0., 1., 0.],
+             [1., -4., 1.],
+             [0., 1., 0.]],
+            dtype=torch.float32,
+            device=dev,
+        ).view(1, 1, 3, 3)
+
+        scores: list[float] = []
+        for region in regions:
+            # RGB → Gray via standard luminance weights (same result as cv2.COLOR_RGB2GRAY)
+            gray = (0.299 * region[:, :, 0].astype(np.float32)
+                    + 0.587 * region[:, :, 1].astype(np.float32)
+                    + 0.114 * region[:, :, 2].astype(np.float32))
+            t = torch.from_numpy(gray).to(dev).unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+            lap = F.conv2d(t, lap_kernel, padding=1)
+            v = float(lap.var().item())
+            score = 1.0 - math.exp(-v / 500.0)
+            scores.append(float(max(0.0, min(1.0, score))))
+        return scores
 
 
 class ExposureScorer:
@@ -139,6 +198,59 @@ class MotionBlurDetector:
         ratio = max(horiz, vert) / (min(horiz, vert) + 1e-6)
         return bool(ratio > 1.35)
 
+    def detect_batch_gpu(self, images: list[np.ndarray], device: str) -> list[bool]:
+        """
+        FFT-based motion blur detection for a batch of images on the GPU.
+
+        Uses torch.fft.fft2 — identical algorithm to _fft_directional_check(),
+        so results are directly comparable to the CPU path.
+
+        Args:
+            images: List of H×W×3 uint8 numpy arrays.
+            device: "cuda" or "mps" (also accepts "cpu" for parity testing).
+
+        Returns:
+            List of bool — True means motion blur detected.
+
+        Raises:
+            ImportError: if torch is not installed.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        dev = torch.device(device)
+        results: list[bool] = []
+
+        for img in images:
+            # RGB → Gray
+            gray = (0.299 * img[:, :, 0].astype(np.float32)
+                    + 0.587 * img[:, :, 1].astype(np.float32)
+                    + 0.114 * img[:, :, 2].astype(np.float32))
+            # Resize to 50% on GPU via bilinear interpolation
+            t = torch.from_numpy(gray).to(dev).unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+            h, w = t.shape[-2], t.shape[-1]
+            t_small = F.interpolate(
+                t, size=(max(1, h // 2), max(1, w // 2)),
+                mode="bilinear", align_corners=False,
+            ).squeeze()
+            t_norm = t_small / 255.0
+
+            # FFT on GPU — uses cuFFT (CUDA) or Accelerate (MPS)
+            f = torch.fft.fft2(t_norm)
+            fshift = torch.fft.fftshift(f)
+            mag = torch.log(torch.abs(fshift) + 1e-6)
+
+            sh, sw = mag.shape
+            cy, cx = sh // 2, sw // 2
+            band = max(2, min(sh, sw) // 20)
+            horiz = float(mag[cy - band: cy + band, :].mean().item())
+            vert = float(mag[:, cx - band: cx + band].mean().item())
+
+            ratio = max(horiz, vert) / (min(horiz, vert) + 1e-6)
+            results.append(bool(ratio > 1.35))
+
+        return results
+
 
 class AestheticScorer:
     """
@@ -160,6 +272,49 @@ class AestheticScorer:
         # Map to 0..10 (simple, bounded).
         score = (0.6 * min(1.0, contrast * 3.0) + 0.4 * min(1.0, sat * 1.5)) * 10.0
         record.aesthetic_score = float(max(0.0, min(10.0, score)))
+
+    def score_batch_gpu(self, images: list[np.ndarray], device: str) -> list[float]:
+        """
+        Contrast + saturation aesthetic score computed on the GPU.
+
+        Avoids cv2.cvtColor by computing RGB→Gray and RGB→saturation via torch
+        tensor math — same formula as score(), so results are directly comparable.
+
+        Args:
+            images: List of H×W×3 uint8 numpy arrays.
+            device: "cuda" or "mps" (also accepts "cpu" for parity testing).
+
+        Returns:
+            List of float aesthetic scores in [0, 10].
+
+        Raises:
+            ImportError: if torch is not installed.
+        """
+        import torch
+
+        dev = torch.device(device)
+        scores: list[float] = []
+
+        for img in images:
+            # (H,W,3) uint8 → (3,H,W) float32 in [0,1]
+            t = torch.from_numpy(img.astype(np.float32) / 255.0).to(dev).permute(2, 0, 1)
+            r, g, b = t[0], t[1], t[2]
+
+            # Luminance → contrast (std dev of grayscale)
+            gray = 0.299 * r + 0.587 * g + 0.114 * b
+            contrast = float(gray.std().item())
+
+            # Saturation = chroma / value, where chroma = max - min across channels
+            cmax, _ = t.max(dim=0)
+            cmin, _ = t.min(dim=0)
+            chroma = cmax - cmin
+            sat_map = torch.where(cmax > 1e-6, chroma / (cmax + 1e-9), torch.zeros_like(cmax))
+            sat = float(sat_map.mean().item())
+
+            score = (0.6 * min(1.0, contrast * 3.0) + 0.4 * min(1.0, sat * 1.5)) * 10.0
+            scores.append(float(max(0.0, min(10.0, score))))
+
+        return scores
 
 
 class CompositionTagger:

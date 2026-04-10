@@ -41,3 +41,19 @@ release_pixel_data: true
 #   4-core CPU: null → 2 workers, 8 → 3 workers (max safe)
 # Performance tested 2026-04-06: 8 workers = 1.25x speedup on 20-core system
 num_workers: null  # Auto-detect (40% of cores, tested optimal)
+
+# GPU acceleration
+# device: Which compute device to use
+#   - auto: prefer cuda > mps > cpu (recommended)
+#   - cpu:  always use CPU (forces multiprocessing mode)
+#   - cuda: require NVIDIA GPU (falls back to auto-detect if unavailable)
+#   - mps:  require Apple Silicon GPU (falls back to auto-detect if unavailable)
+# When device resolves to cuda or mps, multiprocessing is disabled and GPU-batch
+# mode is used instead (CUDA contexts cannot be safely shared across processes).
+device: auto
+
+# Number of images processed simultaneously in GPU-batch mode.
+# Increase for higher GPU utilisation (requires more VRAM).
+# Decrease (e.g. 4) if you hit out-of-memory errors.
+# Ignored when device resolves to cpu.
+gpu_batch_size: 8
