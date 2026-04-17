@@ -52,6 +52,11 @@ def main() -> None:
         session = SessionManager()
         st.session_state["session_manager"] = session
 
+    with st.sidebar:
+        _device = session.pipeline.device
+        _device_labels = {"cuda": "GPU — NVIDIA CUDA", "mps": "GPU — Apple Silicon", "cpu": "CPU"}
+        st.caption(f"Device: {_device_labels.get(_device, _device)}")
+
     # Allow quick tuning without editing YAML yet.
     session.pipeline.config.sharpness_gate_threshold = float(sharpness_threshold)
 
@@ -126,7 +131,7 @@ def main() -> None:
         ]
     ).sort_values(by=["final_score"], ascending=False, na_position="last")
 
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width="stretch", hide_index=True)
 
     st.subheader("Thumbnails")
     top10 = df.head(10).to_dict(orient="records")

@@ -135,7 +135,9 @@ class WhiteBalanceScorer:
 
     def _channel_deviation(self, image: np.ndarray) -> float:
         # Mean channel deviation from neutral grey: lower is better.
-        means = image.reshape(-1, 3).mean(axis=0)  # R,G,B
+        # dtype=float32 avoids numpy's default int64 accumulation on uint8 arrays,
+        # which is slow on large images.
+        means = image.mean(axis=(0, 1), dtype=np.float32)  # R,G,B
         m = float(means.mean()) + 1e-9
         dev = float(np.abs(means - m).mean() / m)  # relative deviation
         # Map 0..~0.3 into 1..0 with a gentle curve.
@@ -263,11 +265,12 @@ class AestheticScorer:
             record.aesthetic_score = None
             return
 
-        img = record.image.astype(np.float32) / 255.0
-        hsv = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+        # Pass uint8 directly to cvtColor — avoids wasteful float32↔uint8 round-trips
+        # that were allocating ~350MB of temporaries per 20MP image.
+        hsv = cv2.cvtColor(record.image, cv2.COLOR_RGB2HSV)
         sat = float(hsv[:, :, 1].mean()) / 255.0
-        gray = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-        contrast = float(gray.std())
+        gray = cv2.cvtColor(record.image, cv2.COLOR_RGB2GRAY)
+        contrast = float(np.std(gray, dtype=np.float32)) / 255.0
 
         # Map to 0..10 (simple, bounded).
         score = (0.6 * min(1.0, contrast * 3.0) + 0.4 * min(1.0, sat * 1.5)) * 10.0

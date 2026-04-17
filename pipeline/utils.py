@@ -17,17 +17,48 @@ class DeviceManager:
 
     @staticmethod
     def detect() -> str:
-        # CUDA-first with safe CPU fallback; MPS becomes relevant on Apple Silicon.
+        """
+        Detect the best available compute device.
+
+        Rules:
+          - NVIDIA CUDA → "cuda"
+          - Apple Silicon MPS → "mps"
+          - AMD/Radeon (ROCm-CUDA) → "cpu"  (multiprocessing is faster for this pipeline)
+          - No GPU / torch missing → "cpu"
+        """
         try:
             import torch  # type: ignore
 
             if torch.cuda.is_available():
+                # Exclude AMD/Radeon — ROCm exposes CUDA-compatible interface but
+                # our heuristic pipeline does not benefit from it and CPU multiprocessing
+                # is better tested on AMD hardware.
+                try:
+                    name = torch.cuda.get_device_name(0).lower()
+                    if "amd" in name or "radeon" in name:
+                        return "cpu"
+                except Exception:
+                    pass
                 return "cuda"
             if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
                 return "mps"
         except Exception:
             pass
         return "cpu"
+
+    @staticmethod
+    def describe(device: str) -> str:
+        """Return a human-readable label for the resolved device (for logging/UI)."""
+        if device == "cuda":
+            try:
+                import torch  # type: ignore
+                name = torch.cuda.get_device_name(0)
+                return f"CUDA ({name})"
+            except Exception:
+                return "CUDA"
+        if device == "mps":
+            return "MPS (Apple Silicon)"
+        return "CPU"
 
     def get_device(self, requested: str = "auto") -> str:
         """

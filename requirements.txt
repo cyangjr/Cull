@@ -1,16 +1,29 @@
+# Core dependencies
 streamlit>=1.32
 numpy>=1.26
 pandas>=2.2
 PyYAML>=6.0
 Pillow>=10.2
-exifread>=3.0.0
+exifread>=3.0
 opencv-python>=4.9
 mediapipe>=0.10
 ImageHash>=4.3
 
-# GPU acceleration (optional — install manually for your platform):
-#   Windows CUDA (NVIDIA):  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-#   Apple Silicon (MPS):    pip install torch torchvision
-#   CPU-only (no GPU):      pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-# torch>=2.1 required for torch.fft.fft2 and stable MPS support.
-# Without PyTorch installed the pipeline runs fully on CPU with no change in behaviour.
+# GPU acceleration (optional, but recommended)
+# Required for MPS/CUDA batch mode. Without it the pipeline runs on CPU only.
+# Install the build that matches your hardware — do NOT use plain `pip install torch`
+# on NVIDIA as it will install the CPU-only build.
+#
+#   Apple Silicon (MPS):
+#     pip install torch torchvision
+#
+#   NVIDIA CUDA 12.x:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+#   NVIDIA CUDA 11.8:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#
+#   CPU-only (no GPU):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+# Minimum: torch>=2.1 (required for torch.fft.fft2 and stable MPS support)
