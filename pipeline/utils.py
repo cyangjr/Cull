@@ -106,6 +106,8 @@ class ImageRecord:
     # detection
     subject_bbox: tuple[int, int, int, int] | None = None
     has_faces: bool = False
+    # True when the detected face is large enough to judge the photo on.
+    face_is_subject: bool = False
     eye_region: tuple[int, int, int, int] | None = None
     saliency_peak_region: tuple[int, int, int, int] | None = None
 
@@ -125,6 +127,8 @@ class ImageRecord:
     perceptual_hash: str | None = None
     final_score: float | None = None
     passed_gate: bool = False
+    # Why the gate failed: "sharpness", "exposure", "face", a comma-joined pair, or "".
+    gate_reason: str = ""
 
     def to_export_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -146,6 +150,7 @@ class ImageRecord:
             scene_type=d.get("scene_type"),
             subject_bbox=tuple(d["subject_bbox"]) if d.get("subject_bbox") else None,
             has_faces=bool(d.get("has_faces", False)),
+            face_is_subject=bool(d.get("face_is_subject", False)),
             eye_region=None,
             saliency_peak_region=tuple(d["saliency_peak_region"]) if d.get("saliency_peak_region") else None,
             sharpness_score=d.get("sharpness_score"),
@@ -159,6 +164,7 @@ class ImageRecord:
             perceptual_hash=d.get("perceptual_hash"),
             final_score=d.get("final_score"),
             passed_gate=bool(d.get("passed_gate", False)),
+            gate_reason=str(d.get("gate_reason") or ""),
         )
 
 

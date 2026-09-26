@@ -16,6 +16,8 @@ from .scorer import (
     MotionBlurDetector,
     SharpnessScorer,
     WhiteBalanceScorer,
+    apply_gate,
+    mark_subject_face,
 )
 from .utils import DeviceManager, ImageLoader, ImageRecord, ModelRegistry
 
@@ -157,7 +159,8 @@ class CullPipeline:
                     self.face_detector.detect(r)
                     timer.add("face_detection", time.perf_counter() - t0)
 
-                # 5) Score sharpness
+                # 5) Score sharpness on the subject face when one is large enough.
+                mark_subject_face(r, self.config)
                 t0 = time.perf_counter()
                 self.sharpness_scorer.score(r)
                 timer.add("sharpness", time.perf_counter() - t0)
@@ -178,7 +181,7 @@ class CullPipeline:
                 self.white_balance_scorer.score(r)
                 timer.add("white_balance", time.perf_counter() - t0)
 
-                # 9) Gate check (sharpness only)
+                # 9) Gate: subject sharpness, exposure, and a usable face.
                 self._run_gate(r)
 
                 # Release full image for gate-failed records immediately.
@@ -317,6 +320,8 @@ class CullPipeline:
                     timer.add("face_detection", time.perf_counter() - t0)
 
             # --- 3. Sharpness — GPU ---
+            for r in batch:
+                mark_subject_face(r, self.config)
             valid = [r for r in batch if r.image is not None]
             regions = [self.sharpness_scorer._select_region(r) for r in valid]
             t0 = time.perf_counter()
@@ -454,8 +459,7 @@ class CullPipeline:
         return self.final_scorer.rank(records)
 
     def _run_gate(self, record: ImageRecord) -> None:
-        thr = float(self.config.sharpness_gate_threshold)
-        record.passed_gate = bool((record.sharpness_score or 0.0) >= thr)
+        apply_gate(record, self.config)
 
     def _run_parallel(
         self,

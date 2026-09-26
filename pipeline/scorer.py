@@ -14,6 +14,51 @@ from .utils import ImageRecord
 # ---------------------------------------------------------------------------
 _TORCH_AVAILABLE: bool | None = None
 
+# Mean luminance outside this window is too dark or too bright to keep.
+# 0.12 ≈ gray 31, 0.88 ≈ gray 224. Values are linear 0..1.
+_EXPOSURE_LUMINANCE_LOW = 0.12
+_EXPOSURE_LUMINANCE_HIGH = 0.88
+
+
+def crop_box(image: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
+    """Return a clamped x,y,w,h crop. Empty boxes fall back to the full image."""
+    x, y, w, h = box
+    img_h, img_w = image.shape[:2]
+    x0 = max(0, min(img_w - 1, int(x)))
+    y0 = max(0, min(img_h - 1, int(y)))
+    x1 = max(x0 + 1, min(img_w, int(x) + int(w)))
+    y1 = max(y0 + 1, min(img_h, int(y) + int(h)))
+    return image[y0:y1, x0:x1]
+
+
+def mark_subject_face(record: ImageRecord, config: PipelineConfig) -> None:
+    """A face is the subject when its eye crop is large enough to judge."""
+    record.face_is_subject = False
+    if not record.has_faces or record.eye_region is None or record.image is None:
+        return
+    _x, _y, w, h = record.eye_region
+    side = int(config.min_subject_face_side)
+    record.face_is_subject = w >= side and h >= side
+
+
+def apply_gate(record: ImageRecord, config: PipelineConfig) -> None:
+    """Reject on sharpness and exposure. A subject face is judged on the face."""
+    reasons: list[str] = []
+    sharp = float(record.sharpness_score or 0.0)
+    exposure = float(record.exposure_score or 0.0)
+    sharp_ok = sharp >= float(config.sharpness_gate_threshold)
+    exposure_ok = exposure >= float(config.exposure_gate_threshold)
+    if record.face_is_subject:
+        if not sharp_ok or not exposure_ok:
+            reasons.append("face")
+    else:
+        if not sharp_ok:
+            reasons.append("sharpness")
+        if not exposure_ok:
+            reasons.append("exposure")
+    record.passed_gate = not reasons
+    record.gate_reason = ",".join(reasons)
+
 
 def _torch_available() -> bool:
     global _TORCH_AVAILABLE
@@ -36,13 +81,10 @@ class SharpnessScorer:
 
     def _select_region(self, record: ImageRecord) -> np.ndarray:
         assert record.image is not None
-        # Phase B: if face detected, score the eye_region crop.
-        if record.has_faces and record.eye_region is not None:
-            x, y, w, h = record.eye_region
-            x2 = min(record.image.shape[1], x + w)
-            y2 = min(record.image.shape[0], y + h)
-            if x2 > x and y2 > y:
-                return record.image[y:y2, x:x2]
+        # Judge a real subject face on the eye crop. A tiny detection is ignored
+        # so noise in a few pixels cannot pass the sharpness gate.
+        if record.face_is_subject and record.eye_region is not None:
+            return crop_box(record.image, record.eye_region)
         # Milestone C: if subject bbox exists, score within bbox.
         if record.subject_bbox is not None:
             x, y, w, h = record.subject_bbox
@@ -114,7 +156,11 @@ class ExposureScorer:
         if record.image is None:
             record.exposure_score = None
             return
-        record.exposure_score = self._analyse_histogram(record.image)
+        image = record.image
+        # Portraits: exposure of the face, so a dark background does not reject a lit subject.
+        if record.face_is_subject and record.eye_region is not None:
+            image = crop_box(record.image, record.eye_region)
+        record.exposure_score = self._analyse_histogram(image)
 
     def _analyse_histogram(self, image: np.ndarray) -> float:
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
@@ -122,8 +168,20 @@ class ExposureScorer:
         total = float(hist.sum()) + 1e-9
         dark_clip = float(hist[:5].sum()) / total
         bright_clip = float(hist[251:].sum()) / total
-        penalty = min(1.0, (dark_clip + bright_clip) * 3.0)
-        return float(max(0.0, 1.0 - penalty))
+        clip_penalty = min(1.0, (dark_clip + bright_clip) * 3.0)
+
+        mean = float(gray.mean()) / 255.0
+        low, high = _EXPOSURE_LUMINANCE_LOW, _EXPOSURE_LUMINANCE_HIGH
+        if mean < low:
+            luma_penalty = (low - mean) / low
+        elif mean > high:
+            luma_penalty = (mean - high) / (1.0 - high)
+        else:
+            luma_penalty = 0.0
+        luma_penalty = float(max(0.0, min(1.0, luma_penalty)))
+
+        score = (1.0 - clip_penalty) * (1.0 - luma_penalty)
+        return float(max(0.0, min(1.0, score)))
 
 
 class WhiteBalanceScorer:

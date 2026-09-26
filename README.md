@@ -50,7 +50,9 @@ Key settings in `config.yaml`:
 | `device` | `auto` | `auto` / `cpu` / `cuda` / `mps` |
 | `gpu_batch_size` | `8` | Images per GPU batch (reduce if OOM) |
 | `num_workers` | `null` | CPU worker count (`null` = auto, `0` = sequential) |
-| `sharpness_gate_threshold` | `0.3` | Images below this score are culled |
+| `sharpness_gate_threshold` | `0.3` | Images below this sharpness are culled |
+| `exposure_gate_threshold` | `0.4` | Images that are too dark or blown out are culled. Portraits are measured on the face |
+| `min_subject_face_side` | `64` | Minimum eye-crop size, in pixels, before a face is treated as the subject |
 | `batch_size` | `16` | Images per CPU batch |
 
 The sharpness threshold can also be tuned live in the Streamlit sidebar without editing `config.yaml`.
