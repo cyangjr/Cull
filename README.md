@@ -53,6 +53,7 @@ Key settings in `config.yaml`:
 | `sharpness_gate_threshold` | `0.3` | Images below this sharpness are culled |
 | `exposure_gate_threshold` | `0.4` | Images that are too dark or blown out are culled. Portraits are measured on the face |
 | `min_subject_face_side` | `64` | Minimum eye-crop size, in pixels, before a face is treated as the subject |
+| `eye_blink_gate_threshold` | `0.5` | Reject a subject face when the more-open eye is still this closed (0 open, 1 closed) |
 | `batch_size` | `16` | Images per CPU batch |
 
 The sharpness threshold can also be tuned live in the Streamlit sidebar without editing `config.yaml`.

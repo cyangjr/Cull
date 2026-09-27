@@ -40,7 +40,7 @@ def main() -> None:
         folder_path = st.text_input("Folder path", value="")
         sharpness_threshold = st.number_input("Sharpness gate threshold", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
         exposure_threshold = st.number_input("Exposure gate threshold", min_value=0.0, max_value=1.0, value=0.4, step=0.05)
-        st.caption("Kept photos must pass sharpness and exposure. A large face is judged on the face.")
+        st.caption("Kept photos must be sharp and well exposed. Pixel noise is not sharpness. Closed eyes fail.")
 
         st.subheader("Results")
         min_score = st.slider("Min final score", 0.0, 1.0, 0.0, 0.01)
@@ -118,6 +118,7 @@ def main() -> None:
                 "final_score": r.final_score,
                 "passed_gate": r.passed_gate,
                 "gate_reason": r.gate_reason,
+                "eye_blink": r.eye_blink_score,
                 "has_faces": r.has_faces,
                 "scene_type": r.scene_type,
                 "is_duplicate": r.is_duplicate,

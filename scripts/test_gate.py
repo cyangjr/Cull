@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -117,7 +118,12 @@ def test_worker_gate() -> None:
 def test_pipeline_folder() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         folder = Path(tmp)
-        Image.fromarray(np.stack([_checker(240, 320, 40, 210, step=2)] * 3, axis=-1)).save(folder / "sharp.jpg")
+        bars = np.full((240, 320), 90, np.uint8)
+        for i in range(0, 320, 40):
+            bars[:, i : i + 20] = 200
+        Image.fromarray(np.stack([bars, bars, bars], axis=-1)).save(folder / "sharp.jpg")
+        rng = np.random.default_rng(0)
+        Image.fromarray(rng.integers(0, 255, (240, 320, 3), dtype=np.uint8)).save(folder / "noise.jpg")
         Image.fromarray(np.full((240, 320, 3), 8, np.uint8)).save(folder / "dark.jpg")
         Image.fromarray(np.full((240, 320, 3), 250, np.uint8)).save(folder / "bright.jpg")
         blur = np.zeros((240, 320, 3), np.uint8)
@@ -134,6 +140,8 @@ def test_pipeline_folder() -> None:
                 f"pass={rec.passed_gate} reason={rec.gate_reason!r} final={rec.final_score}"
             )
         assert by_name["sharp.jpg"].passed_gate is True
+        assert by_name["noise.jpg"].passed_gate is False
+        assert "sharpness" in by_name["noise.jpg"].gate_reason
         assert by_name["dark.jpg"].passed_gate is False
         assert "exposure" in by_name["dark.jpg"].gate_reason
         assert by_name["bright.jpg"].passed_gate is False
@@ -143,11 +151,55 @@ def test_pipeline_folder() -> None:
         assert len(session.get_kept()) == 1
 
 
+def test_closed_eyes_gate() -> None:
+    cfg = PipelineConfig()
+    image = np.stack([_checker(200, 240, 70, 190, step=4)] * 3, axis=-1)
+    record = _record(image, "blink.jpg")
+    record.has_faces = True
+    record.eye_region = (40, 40, 160, 100)
+    record.face_is_subject = True
+    record.eye_blink_score = 0.05
+    SharpnessScorer().score(record)
+    ExposureScorer().score(record)
+    apply_gate(record, cfg)
+    print(f"open eyes pass={record.passed_gate} sharp={record.sharpness_score:.3f} exp={record.exposure_score:.3f}")
+    assert record.passed_gate is True
+
+    record.eye_blink_score = 0.8
+    apply_gate(record, cfg)
+    print(f"closed eyes pass={record.passed_gate} reason={record.gate_reason!r}")
+    assert record.passed_gate is False
+    assert record.gate_reason == "eyes"
+
+
+def test_open_portrait() -> None:
+    """A real open-eyed portrait is a subject face and is kept."""
+    url = "https://storage.googleapis.com/mediapipe-assets/business-person.png"
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "portrait.png"
+        urllib.request.urlretrieve(url, dest)  # noqa: S310
+        session = SessionManager()
+        session.pipeline.config.num_workers = 1
+        session.start(tmp)
+        rec = session.records[0]
+        print(
+            f"portrait blink={rec.eye_blink_score} subject={rec.face_is_subject} "
+            f"pass={rec.passed_gate} reason={rec.gate_reason!r} sharp={rec.sharpness_score}"
+        )
+        assert rec.has_faces is True
+        assert rec.face_is_subject is True
+        assert rec.eye_blink_score is not None and rec.eye_blink_score < 0.5
+        assert rec.passed_gate is True
+        assert rec.gate_reason == ""
+
+
 def main() -> None:
     test_exposure_levels()
     test_subject_face_and_gate()
+    test_closed_eyes_gate()
     test_worker_gate()
     test_pipeline_folder()
+    test_open_portrait()
     print("ALL GATE TESTS PASSED")
 
 

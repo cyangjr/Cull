@@ -157,6 +157,8 @@ class FaceDetector:
             self._python_tasks = python
             self._vision_tasks = vision
 
+            self._min_detection_confidence = float(min_detection_confidence)
+            self._landmarker = None
             self._model_path = self._ensure_model()
             base_options = python.BaseOptions(model_asset_path=str(self._model_path))
             options = vision.FaceDetectorOptions(
@@ -246,4 +248,97 @@ class FaceDetector:
         rw = max(1, x1 - x0)
         rh = max(1, y1 - y0)
         record.eye_region = (x0, y0, rw, rh)
+        record.eye_blink_score = None
+
+    def assess_eyes(self, record: ImageRecord) -> None:
+        """Measure blink on a subject face and tighten the eye crop to the landmarks.
+
+        `eye_blink_score` is the blink of the more-open eye (0 open, 1 closed).
+        A high score means both eyes are closed. Missing landmarks leave the score unset.
+        """
+        record.eye_blink_score = None
+        if not record.face_is_subject or record.image is None:
+            return
+        try:
+            landmarker = self._ensure_landmarker()
+        except Exception:
+            return
+
+        img = record.image
+        if img.dtype != np.uint8:
+            img = np.clip(img, 0, 255).astype(np.uint8)
+        if img.ndim != 3 or img.shape[2] != 3:
+            return
+        mp_image = self._mp.Image(
+            image_format=self._mp.ImageFormat.SRGB,
+            data=np.ascontiguousarray(img),
+        )
+        result = landmarker.detect(mp_image)
+        blends = getattr(result, "face_blendshapes", None) or []
+        if not blends:
+            return
+        scores = {c.category_name: float(c.score) for c in blends[0]}
+        left = scores.get("eyeBlinkLeft")
+        right = scores.get("eyeBlinkRight")
+        if left is None or right is None:
+            return
+        record.eye_blink_score = float(min(left, right))
+        self._refine_eye_region(record, result)
+
+    def _ensure_landmarker(self):
+        if self._landmarker is not None:
+            return self._landmarker
+        model_path = self._ensure_landmarker_model()
+        base_options = self._python_tasks.BaseOptions(model_asset_path=str(model_path))
+        options = self._vision_tasks.FaceLandmarkerOptions(
+            base_options=base_options,
+            num_faces=1,
+            min_face_detection_confidence=self._min_detection_confidence,
+            output_face_blendshapes=True,
+        )
+        self._landmarker = self._vision_tasks.FaceLandmarker.create_from_options(options)
+        return self._landmarker
+
+    def _ensure_landmarker_model(self) -> Path:
+        override = os.environ.get("CULL_FACE_LANDMARKER_PATH")
+        if override:
+            p = Path(override)
+            if not p.exists():
+                raise FileNotFoundError(f"CULL_FACE_LANDMARKER_PATH not found: {override}")
+            return p
+        cache_dir = Path.cwd() / ".cache" / "mediapipe"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        model_path = cache_dir / "face_landmarker.task"
+        if model_path.exists() and model_path.stat().st_size > 0:
+            return model_path
+        url = (
+            "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+            "face_landmarker/float16/1/face_landmarker.task"
+        )
+        urllib.request.urlretrieve(url, model_path)  # noqa: S310
+        return model_path
+
+    @staticmethod
+    def _refine_eye_region(record: ImageRecord, result) -> None:
+        faces = getattr(result, "face_landmarks", None) or []
+        if not faces or record.image is None:
+            return
+        landmarks = faces[0]
+        # Outer and inner corners plus upper and lower lids, both eyes.
+        indices = (33, 133, 159, 145, 362, 263, 386, 374)
+        if len(landmarks) <= max(indices):
+            return
+        height, width = record.image.shape[:2]
+        xs = [landmarks[i].x * width for i in indices]
+        ys = [landmarks[i].y * height for i in indices]
+        span_x = max(xs) - min(xs)
+        span_y = max(ys) - min(ys)
+        pad_x = 0.25 * span_x
+        pad_y = 0.8 * max(span_y, 1.0)
+        x0 = max(0, int(min(xs) - pad_x))
+        y0 = max(0, int(min(ys) - pad_y))
+        x1 = min(width, int(max(xs) + pad_x))
+        y1 = min(height, int(max(ys) + pad_y))
+        if x1 - x0 >= 8 and y1 - y0 >= 8:
+            record.eye_region = (x0, y0, x1 - x0, y1 - y0)
 

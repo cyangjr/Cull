@@ -91,8 +91,13 @@ def worker_process_pregate(record: ImageRecord, config_dict: dict) -> ImageRecor
             except Exception:
                 pass
 
-        # Stage 2: Sharpness scoring (eye crop only when the face is the subject)
+        # Stage 2: Blink on a subject face, then sharpness.
         mark_subject_face(record, config)
+        if face_detector is not None and record.face_is_subject:
+            try:
+                face_detector.assess_eyes(record)
+            except Exception:
+                pass
         sharpness_scorer.score(record)
 
         # Stage 3: Exposure scoring

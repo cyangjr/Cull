@@ -42,14 +42,21 @@ def mark_subject_face(record: ImageRecord, config: PipelineConfig) -> None:
 
 
 def apply_gate(record: ImageRecord, config: PipelineConfig) -> None:
-    """Reject on sharpness and exposure. A subject face is judged on the face."""
+    """Reject soft, poorly exposed, or closed-eye photos. A subject face is judged on the face."""
     reasons: list[str] = []
     sharp = float(record.sharpness_score or 0.0)
     exposure = float(record.exposure_score or 0.0)
     sharp_ok = sharp >= float(config.sharpness_gate_threshold)
     exposure_ok = exposure >= float(config.exposure_gate_threshold)
+    eyes_closed = (
+        record.face_is_subject
+        and record.eye_blink_score is not None
+        and float(record.eye_blink_score) >= float(config.eye_blink_gate_threshold)
+    )
     if record.face_is_subject:
-        if not sharp_ok or not exposure_ok:
+        if eyes_closed:
+            reasons.append("eyes")
+        elif not sharp_ok or not exposure_ok:
             reasons.append("face")
     else:
         if not sharp_ok:
@@ -77,7 +84,12 @@ class SharpnessScorer:
             record.sharpness_score = None
             return
         region = self._select_region(record)
-        record.sharpness_score = self._laplacian_variance(region)
+        # Eye crops stay at full resolution. Whole frames use structure sharpness
+        # so pixel noise and 1–2px patterns cannot pass the gate.
+        if record.face_is_subject:
+            record.sharpness_score = self._fine_sharpness(region)
+        else:
+            record.sharpness_score = self._structure_sharpness(region)
 
     def _select_region(self, record: ImageRecord) -> np.ndarray:
         assert record.image is not None
@@ -101,12 +113,51 @@ class SharpnessScorer:
                 return record.image[y:y2, x:x2]
         return record.image
 
-    def _laplacian_variance(self, region: np.ndarray) -> float:
+    def _fine_sharpness(self, region: np.ndarray) -> float:
         gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
-        v = cv2.Laplacian(gray, cv2.CV_64F).var()
-        # Normalise to 0..1 with a soft saturation curve (empirical).
-        score = 1.0 - math.exp(-float(v) / 500.0)
+        return self._normalized_laplacian(gray)
+
+    def _structure_sharpness(self, region: np.ndarray) -> float:
+        """Sharpness of edges that survive a 16x area downsample.
+
+        Random pixel noise and 2px checkerboards score high on a raw Laplacian
+        and collapse after downsampling. A spectrum check caps whatever grain
+        is left when the frame is almost pure high frequency.
+        """
+        gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
+        h, w = gray.shape[:2]
+        if min(h, w) < 64:
+            return self._normalized_laplacian(gray)
+        coarse = cv2.resize(
+            gray,
+            (max(8, w // 16), max(8, h // 16)),
+            interpolation=cv2.INTER_AREA,
+        )
+        structure = self._normalized_laplacian(coarse)
+        if self._high_frequency_ratio(gray) >= 0.9:
+            structure = min(structure, 0.15)
+        return float(max(0.0, min(1.0, structure)))
+
+    @staticmethod
+    def _normalized_laplacian(gray: np.ndarray) -> float:
+        v = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        score = 1.0 - math.exp(-v / 500.0)
         return float(max(0.0, min(1.0, score)))
+
+    @staticmethod
+    def _high_frequency_ratio(gray: np.ndarray) -> float:
+        g = gray.astype(np.float32)
+        g -= float(g.mean())
+        mag = np.abs(np.fft.fftshift(np.fft.fft2(g)))
+        height, width = mag.shape
+        cy, cx = height // 2, width // 2
+        yy, xx = np.ogrid[:height, :width]
+        radius = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+        rmax = max(1.0, float(min(cy, cx)))
+        high = float(mag[radius > 0.45 * rmax].mean()) if np.any(radius > 0.45 * rmax) else 0.0
+        mid_band = (radius > 0.08 * rmax) & (radius < 0.28 * rmax)
+        mid = float(mag[mid_band].mean()) if np.any(mid_band) else 0.0
+        return high / (mid + 1e-6)
 
     def score_batch_gpu(self, regions: list[np.ndarray], device: str) -> list[float]:
         """

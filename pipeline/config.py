@@ -27,6 +27,8 @@ class PipelineConfig:
     exposure_gate_threshold: float = 0.4
     # Eye crop must be at least this many pixels on both sides to count as the subject.
     min_subject_face_side: int = 64
+    # Both eyes count as closed when the more-open eye is still at least this blink score.
+    eye_blink_gate_threshold: float = 0.5
 
     # motion blur penalty (applied in FinalScorer, not the gate)
     motion_blur_score_penalty: float = 0.5
@@ -78,6 +80,7 @@ class PipelineConfig:
         float_keys = {
             "sharpness_gate_threshold",
             "exposure_gate_threshold",
+            "eye_blink_gate_threshold",
             "motion_blur_score_penalty",
             "yolo_confidence_threshold",
             "timestamp_window_s",

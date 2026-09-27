@@ -114,6 +114,8 @@ class ImageRecord:
     # scores
     sharpness_score: float | None = None
     exposure_score: float | None = None
+    # Blink of the more-open eye, 0 open .. 1 closed. None when no subject face.
+    eye_blink_score: float | None = None
     white_balance_score: float | None = None
     motion_blur_detected: bool | None = None
     aesthetic_score: float | None = None
@@ -155,6 +157,7 @@ class ImageRecord:
             saliency_peak_region=tuple(d["saliency_peak_region"]) if d.get("saliency_peak_region") else None,
             sharpness_score=d.get("sharpness_score"),
             exposure_score=d.get("exposure_score"),
+            eye_blink_score=d.get("eye_blink_score"),
             white_balance_score=d.get("white_balance_score"),
             motion_blur_detected=d.get("motion_blur_detected"),
             aesthetic_score=d.get("aesthetic_score"),
