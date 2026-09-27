@@ -62,7 +62,7 @@ def worker_process_pregate(record: ImageRecord, config_dict: dict) -> ImageRecor
     try:
         from .config import PipelineConfig
         from .detector import FaceDetector
-        from .scorer import ExposureScorer, SharpnessScorer, WhiteBalanceScorer
+        from .scorer import ExposureScorer, SharpnessScorer, WhiteBalanceScorer, apply_gate, mark_subject_face
 
         # Reconstruct config from dict
         config = PipelineConfig()
@@ -91,7 +91,13 @@ def worker_process_pregate(record: ImageRecord, config_dict: dict) -> ImageRecor
             except Exception:
                 pass
 
-        # Stage 2: Sharpness scoring
+        # Stage 2: Blink on a subject face, then sharpness.
+        mark_subject_face(record, config)
+        if face_detector is not None and record.face_is_subject:
+            try:
+                face_detector.assess_eyes(record)
+            except Exception:
+                pass
         sharpness_scorer.score(record)
 
         # Stage 3: Exposure scoring
@@ -100,9 +106,8 @@ def worker_process_pregate(record: ImageRecord, config_dict: dict) -> ImageRecor
         # Stage 4: White balance scoring
         white_balance_scorer.score(record)
 
-        # Stage 5: Gate check (sharpness only)
-        threshold = float(config.sharpness_gate_threshold)
-        record.passed_gate = bool((record.sharpness_score or 0.0) >= threshold)
+        # Stage 5: Gate on sharpness and exposure (face crop when it is the subject)
+        apply_gate(record, config)
 
         # Stage 6: Release pixel data if gate failed
         if config.release_pixel_data and not record.passed_gate:
@@ -114,6 +119,7 @@ def worker_process_pregate(record: ImageRecord, config_dict: dict) -> ImageRecor
     except Exception:
         # If processing fails, mark as gate-failed and return
         record.passed_gate = False
+        record.gate_reason = "error"
         record.image = None
         return record
 

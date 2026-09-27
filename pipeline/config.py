@@ -23,6 +23,12 @@ class PipelineConfig:
 
     # gate thresholds
     sharpness_gate_threshold: float = 0.3
+    # Frames darker or brighter than this are rejected. Portraits use the face crop.
+    exposure_gate_threshold: float = 0.4
+    # Eye crop must be at least this many pixels on both sides to count as the subject.
+    min_subject_face_side: int = 64
+    # Both eyes count as closed when the more-open eye is still at least this blink score.
+    eye_blink_gate_threshold: float = 0.5
 
     # motion blur penalty (applied in FinalScorer, not the gate)
     motion_blur_score_penalty: float = 0.5
@@ -73,13 +79,15 @@ class PipelineConfig:
 
         float_keys = {
             "sharpness_gate_threshold",
+            "exposure_gate_threshold",
+            "eye_blink_gate_threshold",
             "motion_blur_score_penalty",
             "yolo_confidence_threshold",
             "timestamp_window_s",
             "min_face_detection_confidence",
             "saliency_peak_threshold",
         }
-        int_keys = {"hash_threshold", "batch_size", "num_workers", "gpu_batch_size"}
+        int_keys = {"hash_threshold", "batch_size", "num_workers", "gpu_batch_size", "min_subject_face_side"}
         bool_keys = {
             "enable_router",
             "enable_object_detector",

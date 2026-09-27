@@ -16,6 +16,8 @@ from .scorer import (
     MotionBlurDetector,
     SharpnessScorer,
     WhiteBalanceScorer,
+    apply_gate,
+    mark_subject_face,
 )
 from .utils import DeviceManager, ImageLoader, ImageRecord, ModelRegistry
 
@@ -157,7 +159,12 @@ class CullPipeline:
                     self.face_detector.detect(r)
                     timer.add("face_detection", time.perf_counter() - t0)
 
-                # 5) Score sharpness
+                # 5) Score sharpness on the subject face when one is large enough.
+                mark_subject_face(r, self.config)
+                if self.config.enable_face_detector and r.face_is_subject:
+                    t0 = time.perf_counter()
+                    self.face_detector.assess_eyes(r)
+                    timer.add("eyes", time.perf_counter() - t0)
                 t0 = time.perf_counter()
                 self.sharpness_scorer.score(r)
                 timer.add("sharpness", time.perf_counter() - t0)
@@ -178,7 +185,7 @@ class CullPipeline:
                 self.white_balance_scorer.score(r)
                 timer.add("white_balance", time.perf_counter() - t0)
 
-                # 9) Gate check (sharpness only)
+                # 9) Gate: subject sharpness, exposure, and a usable face.
                 self._run_gate(r)
 
                 # Release full image for gate-failed records immediately.
@@ -316,17 +323,21 @@ class CullPipeline:
                         pass
                     timer.add("face_detection", time.perf_counter() - t0)
 
-            # --- 3. Sharpness — GPU ---
-            valid = [r for r in batch if r.image is not None]
-            regions = [self.sharpness_scorer._select_region(r) for r in valid]
+            # --- 3. Eyes, then sharpness ---
+            # Structure sharpness (noise vs real edges) is defined in SharpnessScorer.score
+            # so CPU and GPU runs make the same gate decision.
+            for r in batch:
+                mark_subject_face(r, self.config)
+                if self.config.enable_face_detector and r.face_is_subject:
+                    t0 = time.perf_counter()
+                    try:
+                        self.face_detector.assess_eyes(r)
+                    except Exception:
+                        pass
+                    timer.add("eyes", time.perf_counter() - t0)
             t0 = time.perf_counter()
-            try:
-                scores = self.sharpness_scorer.score_batch_gpu(regions, device)
-                for r, s in zip(valid, scores):
-                    r.sharpness_score = s
-            except Exception:
-                for r in batch:
-                    self.sharpness_scorer.score(r)
+            for r in batch:
+                self.sharpness_scorer.score(r)
             timer.add("sharpness", time.perf_counter() - t0)
 
             # --- 4. Exposure + white balance (CPU) ---
@@ -454,8 +465,7 @@ class CullPipeline:
         return self.final_scorer.rank(records)
 
     def _run_gate(self, record: ImageRecord) -> None:
-        thr = float(self.config.sharpness_gate_threshold)
-        record.passed_gate = bool((record.sharpness_score or 0.0) >= thr)
+        apply_gate(record, self.config)
 
     def _run_parallel(
         self,
