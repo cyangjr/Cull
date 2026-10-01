@@ -106,7 +106,11 @@ class ImageRecord:
     # detection
     subject_bbox: tuple[int, int, int, int] | None = None
     has_faces: bool = False
+    face_count: int = 0
     eye_region: tuple[int, int, int, int] | None = None
+    # 1 = eyes open on the primary (largest) face, 0 = closed. None if unknown.
+    eyes_open_score: float | None = None
+    blink_detected: bool | None = None
     saliency_peak_region: tuple[int, int, int, int] | None = None
 
     # scores
@@ -118,6 +122,8 @@ class ImageRecord:
 
     # composition
     composition_tags: list[str] = field(default_factory=list)
+    # Neutral baseline when untagged is 0.6. None means composition was not run.
+    composition_score: float | None = None
 
     # pipeline output
     is_duplicate: bool = False
@@ -146,7 +152,10 @@ class ImageRecord:
             scene_type=d.get("scene_type"),
             subject_bbox=tuple(d["subject_bbox"]) if d.get("subject_bbox") else None,
             has_faces=bool(d.get("has_faces", False)),
+            face_count=int(d.get("face_count") or 0),
             eye_region=None,
+            eyes_open_score=d.get("eyes_open_score"),
+            blink_detected=d.get("blink_detected"),
             saliency_peak_region=tuple(d["saliency_peak_region"]) if d.get("saliency_peak_region") else None,
             sharpness_score=d.get("sharpness_score"),
             exposure_score=d.get("exposure_score"),
@@ -154,6 +163,7 @@ class ImageRecord:
             motion_blur_detected=d.get("motion_blur_detected"),
             aesthetic_score=d.get("aesthetic_score"),
             composition_tags=list(d.get("composition_tags") or []),
+            composition_score=d.get("composition_score"),
             is_duplicate=bool(d.get("is_duplicate", False)),
             duplicate_group=d.get("duplicate_group"),
             perceptual_hash=d.get("perceptual_hash"),
@@ -198,6 +208,13 @@ class ImageLoader:
         image_np = np.array(img)
 
         exif = self._extract_exif(path)
+        if not exif.get("timestamp"):
+            # Burst grouping needs a clock. File mtime covers scans that stripped EXIF.
+            try:
+                exif["timestamp"] = datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds")
+                exif["timestamp_source"] = "mtime"
+            except Exception:
+                pass
         return ImageRecord(
             path=str(p),
             filename=p.name,
