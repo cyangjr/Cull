@@ -11,13 +11,14 @@ import yaml
 class PipelineConfig:
     config_path: str = "config.yaml"
 
-    # scorer weights
+    # scorer weights — technical quality. Legacy white_balance / aesthetic
+    # keys are still accepted when present in a yaml file.
     final_score_weights: dict[str, float] = field(
         default_factory=lambda: {
-            "sharpness": 0.4,
-            "exposure": 0.15,
-            "white_balance": 0.15,
-            "aesthetic": 0.3,
+            "sharpness": 0.55,
+            "exposure": 0.20,
+            "subject": 0.15,
+            "composition": 0.10,
         }
     )
 
@@ -25,14 +26,18 @@ class PipelineConfig:
     sharpness_gate_threshold: float = 0.3
 
     # motion blur penalty (applied in FinalScorer, not the gate)
-    motion_blur_score_penalty: float = 0.5
+    motion_blur_score_penalty: float = 0.75
 
     # detector settings (Phase C)
     yolo_confidence_threshold: float = 0.4
 
     # duplicate filter settings (Phase C)
     hash_threshold: int = 8
-    timestamp_window_s: float = 2.0
+    timestamp_window_s: float = 8.0
+
+    # analysis / blink knobs
+    sharpness_analysis_long_edge: int = 512
+    blink_openness_threshold: float = 0.28
 
     # milestone C toggles
     enable_router: bool = True
@@ -78,8 +83,15 @@ class PipelineConfig:
             "timestamp_window_s",
             "min_face_detection_confidence",
             "saliency_peak_threshold",
+            "blink_openness_threshold",
         }
-        int_keys = {"hash_threshold", "batch_size", "num_workers", "gpu_batch_size"}
+        int_keys = {
+            "hash_threshold",
+            "batch_size",
+            "num_workers",
+            "gpu_batch_size",
+            "sharpness_analysis_long_edge",
+        }
         bool_keys = {
             "enable_router",
             "enable_object_detector",
