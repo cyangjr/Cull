@@ -10,6 +10,223 @@ import numpy as np
 from .utils import ImageRecord
 
 
+def select_primary_face(faces: list[dict]) -> int | None:
+    """Index of the largest face. Equal area keeps the higher detection score."""
+    if not faces:
+        return None
+    best_idx = 0
+    best_area = float(faces[0]["area"])
+    best_score = float(faces[0]["score"])
+    for idx, face in enumerate(faces[1:], start=1):
+        area = float(face["area"])
+        score = float(face["score"])
+        if area > best_area or (area == best_area and score > best_score):
+            best_idx = idx
+            best_area = area
+            best_score = score
+    return best_idx
+
+
+def eye_openness(roi: np.ndarray) -> float:
+    """
+    Openness of an RGB eye crop in 0..1 (1 = open).
+
+    Downscales to 64x40, measures the tallest dark band in the center
+    strip, and maps that band's height into the calibrated 0..1 score.
+    """
+    import cv2
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    small = cv2.resize(gray, (64, 40), interpolation=cv2.INTER_AREA)
+    row = small[:, 24:40].min(axis=1)
+    lo = float(row.min())
+    hi = float(row.max())
+    if hi - lo <= 1e-6:
+        return 0.0
+    row = (row - lo) / (hi - lo)
+    darkness = 1.0 - row
+    dark = darkness >= 0.45
+    run = 0
+    longest = 0
+    for is_dark in dark:
+        if is_dark:
+            run += 1
+            if run > longest:
+                longest = run
+        else:
+            run = 0
+    height_frac = longest / len(row)
+    score = (height_frac - 0.08) / 0.35
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def blink_from_openness(openness: float, threshold: float = 0.28) -> bool:
+    """True when the eye-openness score is below the blink threshold."""
+    return bool(openness < threshold)
+
+
+def _detection_score(det) -> float:
+    categories = getattr(det, "categories", None) or []
+    if not categories:
+        return 0.0
+    score = getattr(categories[0], "score", 0.0)
+    if score is None:
+        return 0.0
+    return float(score)
+
+
+def _keypoint_norm_xy(keypoint) -> tuple[float, float] | None:
+    if keypoint is None:
+        return None
+    if isinstance(keypoint, dict):
+        if "x" not in keypoint or "y" not in keypoint:
+            return None
+        return float(keypoint["x"]), float(keypoint["y"])
+    x = getattr(keypoint, "x", None)
+    y = getattr(keypoint, "y", None)
+    if x is None or y is None:
+        return None
+    return float(x), float(y)
+
+
+def _crop_if_large_enough(image: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> np.ndarray | None:
+    h, w = image.shape[:2]
+    x0 = max(0, min(w, x0))
+    y0 = max(0, min(h, y0))
+    x1 = max(0, min(w, x1))
+    y1 = max(0, min(h, y1))
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    return np.ascontiguousarray(image[y0:y1, x0:x1])
+
+
+def _centered_square_crop(image: np.ndarray, cx: float, cy: float, size: float) -> np.ndarray | None:
+    side = int(round(size))
+    if side < 8:
+        return None
+    x0 = int(round(cx)) - side // 2
+    y0 = int(round(cy)) - side // 2
+    return _crop_if_large_enough(image, x0, y0, x0 + side, y0 + side)
+
+
+def _eye_crops_from_keypoints(image: np.ndarray, det, img_w: int, img_h: int) -> list[np.ndarray]:
+    keypoints = getattr(det, "keypoints", None) or []
+    if len(keypoints) < 1:
+        return []
+    bb = det.bounding_box
+    crop_size = 0.35 * float(bb.width)
+    crops: list[np.ndarray] = []
+    for idx in (0, 1):
+        if idx >= len(keypoints):
+            break
+        xy = _keypoint_norm_xy(keypoints[idx])
+        if xy is None:
+            continue
+        nx, ny = xy
+        crop = _centered_square_crop(image, nx * img_w, ny * img_h, crop_size)
+        if crop is not None:
+            crops.append(crop)
+    return crops
+
+
+def _fallback_eye_crops(image: np.ndarray, det) -> list[np.ndarray]:
+    """Left and right halves of the upper 45% of the face box."""
+    bb = det.bounding_box
+    h, w = image.shape[:2]
+    x0 = int(np.floor(float(bb.origin_x)))
+    y0 = int(np.floor(float(bb.origin_y)))
+    x1 = int(np.ceil(float(bb.origin_x) + float(bb.width)))
+    y1 = int(np.ceil(float(bb.origin_y) + float(bb.height) * 0.45))
+    x0 = max(0, min(w, x0))
+    y0 = max(0, min(h, y0))
+    x1 = max(0, min(w, x1))
+    y1 = max(0, min(h, y1))
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return []
+    mid = x0 + (x1 - x0) // 2
+    crops: list[np.ndarray] = []
+    for a, b in ((x0, mid), (mid, x1)):
+        crop = _crop_if_large_enough(image, a, y0, b, y1)
+        if crop is not None:
+            crops.append(crop)
+    return crops
+
+
+def _eye_region_from_bbox(bb, img_w: int, img_h: int) -> tuple[int, int, int, int]:
+    """Upper-face crop: pad the box, then keep the top ~65%."""
+    x0, y0 = float(bb.origin_x), float(bb.origin_y)
+    bw, bh = float(bb.width), float(bb.height)
+    x1, y1 = x0 + bw, y0 + bh
+
+    pad_x = 0.15 * (x1 - x0)
+    pad_y = 0.20 * (y1 - y0)
+    x0 = max(0, int(x0 - pad_x))
+    y0 = max(0, int(y0 - pad_y))
+    x1 = min(img_w, int(x1 + pad_x))
+    y1 = min(img_h, int(y0 + (y1 - y0) * 0.65))
+
+    rw = max(1, x1 - x0)
+    rh = max(1, y1 - y0)
+    return (x0, y0, rw, rh)
+
+
+def _clear_face_fields(record: ImageRecord) -> None:
+    record.has_faces = False
+    record.face_count = 0
+    record.eye_region = None
+    record.eyes_open_score = None
+    record.blink_detected = None
+
+
+def _openness_from_detection(image: np.ndarray, det) -> float | None:
+    h, w = image.shape[:2]
+    crops = _eye_crops_from_keypoints(image, det, w, h)
+    if not crops:
+        crops = _fallback_eye_crops(image, det)
+    if not crops:
+        return None
+    return min(eye_openness(crop) for crop in crops)
+
+
+def _annotate_record(
+    record: ImageRecord,
+    image: np.ndarray | None,
+    detections: list,
+    blink_openness_threshold: float,
+) -> None:
+    """Write face, eye-region, and blink fields from detector results."""
+    dets = list(detections or [])
+    if image is None or not dets:
+        _clear_face_fields(record)
+        return
+
+    h, w = image.shape[:2]
+    faces = [
+        {
+            "area": float(det.bounding_box.width) * float(det.bounding_box.height),
+            "score": _detection_score(det),
+        }
+        for det in dets
+    ]
+    primary_idx = select_primary_face(faces)
+    if primary_idx is None:
+        _clear_face_fields(record)
+        return
+
+    primary = dets[primary_idx]
+    record.face_count = len(dets)
+    record.has_faces = record.face_count > 0
+    record.eye_region = _eye_region_from_bbox(primary.bounding_box, w, h)
+
+    openness = _openness_from_detection(image, primary)
+    if openness is None:
+        record.eyes_open_score = None
+        record.blink_detected = None
+        return
+    record.eyes_open_score = float(openness)
+    record.blink_detected = blink_from_openness(openness, blink_openness_threshold)
+
+
 class ObjectDetector:
     """
     Milestone C fallback: without YOLO, approximate subject bbox from face bbox if present.
@@ -74,80 +291,19 @@ class SaliencyDetector:
         return (x0, y0, x1 - x0, y1 - y0)
 
     def detect_batch_gpu(self, records: list, device: str) -> None:
-        """
-        Sobel-based saliency detection for a batch of records on the GPU.
-
-        Uses torch.nn.functional.conv2d with fixed Sobel kernels — identical
-        algorithm to detect(), so saliency maps are directly comparable.
-        Results are written into each record's saliency_map and
-        saliency_peak_region fields in-place.
-
-        Args:
-            records: ImageRecord objects whose .image is not None.
-            device:  "cuda" or "mps" (also accepts "cpu" for parity testing).
-
-        Raises:
-            ImportError: if torch is not installed.
-        """
-        import numpy as np
-        import torch
-        import torch.nn.functional as F
-
-        dev = torch.device(device)
-
-        sobel_x = torch.tensor(
-            [[-1., 0., 1.],
-             [-2., 0., 2.],
-             [-1., 0., 1.]],
-            dtype=torch.float32, device=dev,
-        ).view(1, 1, 3, 3)
-        sobel_y = torch.tensor(
-            [[-1., -2., -1.],
-             [0.,  0.,  0.],
-             [1.,  2.,  1.]],
-            dtype=torch.float32, device=dev,
-        ).view(1, 1, 3, 3)
-
+        """Same maps as detect(). `device` is ignored so the peak box cannot drift."""
+        del device
         for record in records:
-            if record.image is None:
-                record.saliency_map = None
-                record.saliency_peak_region = None
-                continue
-
-            img = record.image
-            gray = (0.299 * img[:, :, 0].astype(np.float32)
-                    + 0.587 * img[:, :, 1].astype(np.float32)
-                    + 0.114 * img[:, :, 2].astype(np.float32))
-            t = torch.from_numpy(gray).to(dev).unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-
-            gx = F.conv2d(t, sobel_x, padding=1)
-            gy = F.conv2d(t, sobel_y, padding=1)
-            mag = torch.sqrt(gx ** 2 + gy ** 2)
-            # Gaussian blur matching cv2.GaussianBlur(ksize=(0,0), sigmaX=3):
-            # ksize = 2 * ceil(3 * sigma) + 1 = 19 for sigma=3
-            # Gaussian blur matching cv2.GaussianBlur(ksize=(0,0), sigmaX=3).
-            # Note: torch conv2d uses zero-padding while OpenCV defaults to
-            # BORDER_REFLECT_101, so peak region may differ by a few pixels at
-            # image borders. The difference is <1% on typical camera images and
-            # has no meaningful impact on sharpness region selection.
-            sigma = 3.0
-            ksize = 19
-            half = ksize // 2
-            ax = torch.arange(ksize, dtype=torch.float32, device=dev) - half
-            gauss_1d = torch.exp(-ax ** 2 / (2 * sigma ** 2))
-            gauss_1d = gauss_1d / gauss_1d.sum()
-            gauss_2d = (gauss_1d.unsqueeze(1) * gauss_1d.unsqueeze(0)).view(1, 1, ksize, ksize)
-            mag = F.conv2d(mag, gauss_2d, padding=half)
-
-            mag_np = mag.squeeze().cpu().numpy()
-            mag_norm = (mag_np / (float(mag_np.max()) + 1e-9)).astype(np.float32)
-
-            record.saliency_map = mag_norm
-            record.saliency_peak_region = self.get_peak_region(mag_norm)
+            self.detect(record)
 
 
 class FaceDetector:
-    def __init__(self, min_detection_confidence: float = 0.5) -> None:
+    def __init__(
+        self,
+        min_detection_confidence: float = 0.5,
+        blink_openness_threshold: float = 0.28,
+    ) -> None:
+        self.blink_openness_threshold = float(blink_openness_threshold)
         try:
             import mediapipe as mp  # type: ignore
             from mediapipe.tasks import python  # type: ignore
@@ -207,12 +363,10 @@ class FaceDetector:
 
     def detect(self, record: ImageRecord) -> None:
         if record.image is None:
-            record.has_faces = False
-            record.eye_region = None
+            _clear_face_fields(record)
             return
 
         img = record.image
-        h, w = img.shape[:2]
 
         # MediaPipe expects RGB uint8.
         if img.dtype != np.uint8:
@@ -221,29 +375,5 @@ class FaceDetector:
         mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=img)
         res = self._detector.detect(mp_image)
         dets = getattr(res, "detections", None) or []
-        if not dets:
-            record.has_faces = False
-            record.eye_region = None
-            return
-
-        det = dets[0]
-        record.has_faces = True
-
-        # Tasks API provides a face bounding box; use its upper region as an eye-proxy crop.
-        bb = det.bounding_box
-        x0, y0 = float(bb.origin_x), float(bb.origin_y)
-        bw, bh = float(bb.width), float(bb.height)
-        x1, y1 = x0 + bw, y0 + bh
-
-        # Expand region a bit to be robust, and bias toward upper face (eyes).
-        pad_x = 0.15 * (x1 - x0)
-        pad_y = 0.20 * (y1 - y0)
-        x0 = max(0, int(x0 - pad_x))
-        y0 = max(0, int(y0 - pad_y))
-        x1 = min(w, int(x1 + pad_x))
-        y1 = min(h, int(y0 + (y1 - y0) * 0.65))  # top ~65% of face bbox
-
-        rw = max(1, x1 - x0)
-        rh = max(1, y1 - y0)
-        record.eye_region = (x0, y0, rw, rh)
+        _annotate_record(record, img, dets, self.blink_openness_threshold)
 
